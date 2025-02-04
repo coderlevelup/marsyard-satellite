@@ -6,9 +6,9 @@ import time
 app = Flask(__name__)
 
 # Load the template image (grayscale) and precompute its ORB keypoints and descriptors.
-template = cv2.imread('mars_rover_template.jpg', cv2.IMREAD_GRAYSCALE)
+template = cv2.imread('mars_rover_body_template.jpg', cv2.IMREAD_GRAYSCALE)
 if template is None:
-    raise ValueError("Template image 'mars_rover_template.jpg' not found.")
+    raise ValueError("Template image 'mars_rover_template' not found.")
 template_h, template_w = template.shape
 
 # Initialize ORB detector.
@@ -25,6 +25,7 @@ def capture_image():
     Captures a single image from an alternative camera (device index 1)
     and returns it as a BGR NumPy array.
     """
+    print("capturing...")
     cap = cv2.VideoCapture(1)  # Adjust index if needed.
     if not cap.isOpened():
         raise RuntimeError("Could not open camera on device index 1")
@@ -37,7 +38,7 @@ def capture_image():
     
     if not ret:
         raise RuntimeError("Failed to capture image from the camera")
-    
+    print("capturing done.")
     return frame
 
 def find_template_orb(image, min_matches=10):
