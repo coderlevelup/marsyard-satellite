@@ -5,93 +5,161 @@ import time
 
 app = Flask(__name__)
 
-def preprocess_image(gray):
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    return clahe.apply(gray)
+# --- YOLO MODEL SETUP ---
+YOLO_CONFIG = "yolov3.cfg"
+YOLO_WEIGHTS = "yolov3.weights"
+YOLO_NAMES = "coco.names"
 
-# Load and preprocess the template image.
-template = cv2.imread('mars_rover_template.jpg', cv2.IMREAD_GRAYSCALE)
-if template is None:
-    raise ValueError("Template image 'mars_rover_template.jpg' not found.")
-template = preprocess_image(template)
-template_h, template_w = template.shape
+# Load class names from the coco.names file.
+with open(YOLO_NAMES, "r") as f:
+    classes = [line.strip() for line in f.readlines()]
 
-# Initialize SIFT detector.
-sift = cv2.SIFT_create()
+# Set your target class. Change this to a class present in coco.names.
+TARGET_CLASS = "truck"
 
-# Compute keypoints and descriptors for the template.
-kp_template, des_template = sift.detectAndCompute(template, None)
+# Load YOLO model.
+net = cv2.dnn.readNetFromDarknet(YOLO_CONFIG, YOLO_WEIGHTS)
+net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
 
-# Create a BFMatcher object using L2 norm.
-bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+# Get the output layer names.
+layer_names = net.getLayerNames()
+# Some versions of OpenCV return a tuple for getUnconnectedOutLayers().
+unconnected_layers = net.getUnconnectedOutLayers()
+if isinstance(unconnected_layers, tuple):
+    output_layers = [layer_names[i - 1] for i in unconnected_layers]
+else:
+    output_layers = [layer_names[i - 1] for i in unconnected_layers.flatten()]
 
+# --- IMAGE CAPTURE FUNCTION ---
 def capture_image():
-    cap = cv2.VideoCapture(1)  # Adjust index if needed.
+    """
+    Captures a single image from an alternative camera (device index 1)
+    and returns it as a BGR NumPy array.
+    """
+    cap = cv2.VideoCapture(1)  # Change index if needed.
     if not cap.isOpened():
         raise RuntimeError("Could not open camera on device index 1")
-    time.sleep(0.5)
+    
+    time.sleep(0.5)  # Allow the camera to warm up.
     ret, frame = cap.read()
     cap.release()
+    
     if not ret:
         raise RuntimeError("Failed to capture image from the camera")
+    
     return frame
 
-def find_template_sift(image, min_matches=10, ratio_thresh=0.85):
-    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray_image = preprocess_image(gray_image)
-    kp_scene, des_scene = sift.detectAndCompute(gray_image, None)
-    if des_scene is None:
+# --- YOLO DETECTION FUNCTION ---
+def detect_target_yolo(image, conf_threshold=0.5, nms_threshold=0.4):
+    """
+    Uses YOLO to detect objects in the image and returns the bounding box and centroid
+    of the detection matching TARGET_CLASS with the highest confidence.
+    
+    Args:
+        image: BGR image from the camera.
+        conf_threshold: Confidence threshold for detections.
+        nms_threshold: Non-maxima suppression threshold.
+    
+    Returns:
+        center (tuple): (center_x, center_y) of the detected object.
+        box (tuple): (x, y, w, h) bounding box of the detected object.
+        If no target is found, returns (None, None).
+    """
+    height, width = image.shape[:2]
+    # Create a blob from the image.
+    blob = cv2.dnn.blobFromImage(image, scalefactor=1/255.0, size=(416, 416),
+                                 swapRB=True, crop=False)
+    net.setInput(blob)
+    outputs = net.forward(output_layers)
+    
+    boxes = []
+    confidences = []
+    class_ids = []
+    
+    # Loop over each output layer.
+    for output in outputs:
+        for detection in output:
+            scores = detection[5:]
+            class_id = np.argmax(scores)
+            confidence = scores[class_id]
+            if confidence > conf_threshold:
+                center_x = int(detection[0] * width)
+                center_y = int(detection[1] * height)
+                w = int(detection[2] * width)
+                h = int(detection[3] * height)
+                x = int(center_x - w / 2)
+                y = int(center_y - h / 2)
+                
+                boxes.append([x, y, w, h])
+                confidences.append(float(confidence))
+                class_ids.append(class_id)
+    
+    # Apply non-maxima suppression.
+    indices = cv2.dnn.NMSBoxes(boxes, confidences, conf_threshold, nms_threshold)
+    if len(indices) > 0:
+        indices = np.array(indices).flatten()
+    else:
+        indices = []
+    
+    best_box = None
+    best_conf = -1
+    # Look for detections matching our target class.
+    for i in indices:
+        if classes[class_ids[i]] == TARGET_CLASS:
+            if confidences[i] > best_conf:
+                best_conf = confidences[i]
+                best_box = boxes[i]
+    
+    if best_box is not None:
+        x, y, w, h = best_box
+        center = (x + w // 2, y + h // 2)
+        return center, best_box
+    else:
         return None, None
-    knn_matches = bf.knnMatch(des_template, des_scene, k=2)
-    good_matches = []
-    for m, n in knn_matches:
-        if m.distance < ratio_thresh * n.distance:
-            good_matches.append(m)
-    print(f"Found {len(good_matches)} good matches.")  # Debug print
-    if len(good_matches) < min_matches:
-        return None, None
-    pts_template = np.float32([kp_template[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-    pts_scene = np.float32([kp_scene[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-    H, mask = cv2.findHomography(pts_template, pts_scene, cv2.RANSAC, 5.0)
-    if H is None:
-        return None, None
-    template_corners = np.float32([[0, 0],
-                                   [template_w, 0],
-                                   [template_w, template_h],
-                                   [0, template_h]]).reshape(-1, 1, 2)
-    scene_corners = cv2.perspectiveTransform(template_corners, H)
-    center = np.mean(scene_corners, axis=0)[0]
-    center = (int(center[0]), int(center[1]))
-    return center, scene_corners
 
+# --- FLASK ENDPOINTS ---
 @app.route('/find_rover', methods=['GET'])
 def find_rover_endpoint():
+    """
+    Capture an image from the camera, use YOLO to detect the target object,
+    and return its center coordinates as JSON.
+    """
     try:
         image = capture_image()
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-    center, corners = find_template_sift(image)
+    
+    center, box = detect_target_yolo(image)
     if center is None:
-        return jsonify({'error': 'Template not found'}), 404
+        return jsonify({'error': 'Target object not found'}), 404
     else:
         return jsonify({'x': center[0], 'y': center[1]})
 
 @app.route('/render', methods=['GET'])
 def render_endpoint():
+    """
+    Capture an image from the camera, use YOLO to detect the target object,
+    annotate the image with a bounding box and the center coordinate,
+    and return the annotated image as a JPEG.
+    """
     try:
         image = capture_image()
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-    center, corners = find_template_sift(image)
-    if center is not None and corners is not None:
-        corners_int = np.int32(corners)
-        cv2.polylines(image, [corners_int], isClosed=True, color=(0, 255, 0), thickness=2)
+    
+    center, box = detect_target_yolo(image)
+    
+    if center is not None and box is not None:
+        x, y, w, h = box
+        cv2.rectangle(image, (x, y), (x+w, y+h), (0, 255, 0), 2)
         cv2.circle(image, center, 5, (0, 255, 0), -1)
-        cv2.putText(image, f'Template ({center[0]}, {center[1]})', (center[0]-40, center[1]-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        cv2.putText(image, f'{TARGET_CLASS} ({center[0]}, {center[1]})', 
+                    (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
     else:
-        cv2.putText(image, 'Template not found', (10, 30),
+        cv2.putText(image, 'Target object not found', (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+    
     ret, jpeg = cv2.imencode('.jpg', image)
     if not ret:
         return jsonify({'error': 'Could not encode image'}), 500
