@@ -6,30 +6,42 @@ import time
 
 app = Flask(__name__)
 
-# --- Template Preparation using ORB ---
+def preprocess_image(gray_img):
+    """Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to enhance contrast."""
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    return clahe.apply(gray_img)
 
-# Load the template image in grayscale.
-template = cv2.imread('mars_rover_template-nobg.png', cv2.IMREAD_GRAYSCALE)
+# --- Template Preparation using SIFT ---
+
+template_path = 'mars_rover_template.jpg'
+template = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
 if template is None:
-    raise ValueError("Template image 'mars_rover_template.jpg' not found.")
+    raise ValueError(f"Template image '{template_path}' not found.")
+
+# Preprocess the template to boost contrast.
+template = preprocess_image(template)
 template_h, template_w = template.shape
 
-# Initialize ORB detector.
-orb = cv2.ORB_create(nfeatures=1500)
+# Initialize SIFT detector.
+sift = cv2.SIFT_create()
 
 # Compute keypoints and descriptors for the template.
-kp_template, des_template = orb.detectAndCompute(template, None)
+kp_template, des_template = sift.detectAndCompute(template, None)
 print("Template keypoints:", len(kp_template))
 
-# Create a BFMatcher object using Hamming distance.
-bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+# Optionally, save an image with keypoints drawn for debugging.
+template_kp_img = cv2.drawKeypoints(template, kp_template, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+cv2.imwrite("template_keypoints.jpg", template_kp_img)
+
+# Create a BFMatcher object using L2 norm (suitable for SIFT).
+bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
 
 # --- Image Capture Function ---
 
 def capture_image():
     """
-    Checks if 'capture.jpg' exists. If it does, loads and returns that image.
-    Otherwise, captures an image from the webcam (device index 1), saves it to 'capture.jpg',
+    Checks if 'capture.jpg' exists; if so, loads and returns that image.
+    Otherwise, captures an image from the webcam (device index 1), saves it as 'capture.jpg',
     and returns the captured image.
     """
     filename = "capture.jpg"
@@ -41,7 +53,7 @@ def capture_image():
         return image
     else:
         print("Capture file not found. Capturing new image from webcam.")
-        cap = cv2.VideoCapture(1)  # Adjust the index if needed.
+        cap = cv2.VideoCapture(1)  # Adjust index if needed.
         if not cap.isOpened():
             raise RuntimeError("Could not open camera on device index 1")
         time.sleep(0.5)  # Allow the camera to warm up.
@@ -49,52 +61,59 @@ def capture_image():
         cap.release()
         if not ret:
             raise RuntimeError("Failed to capture image from the camera")
-        # Save the captured image to file.
         cv2.imwrite(filename, frame)
         return frame
 
-# --- Template Matching using ORB ---
+# --- Template Matching using SIFT ---
 
-def find_template_orb(image, min_matches=10, ratio_thresh=0.75):
+def find_template_sift(image, min_matches=5, ratio_thresh=0.75):
     """
-    Detects the template in the given image using ORB feature matching.
+    Detects the template in the given image using SIFT feature matching.
     
     Args:
-        image: BGR image.
+        image: BGR image captured from the camera.
         min_matches: Minimum number of good matches required.
-        ratio_thresh: Lowe's ratio threshold.
+        ratio_thresh: Lowe's ratio threshold for filtering matches.
     
     Returns:
         center (tuple): (center_x, center_y) of the detected template region.
-        corners (np.array): Array of the 4 transformed corner points of the template.
-        good_matches (list): List of good matches.
-        If detection fails, returns (None, None, None).
+        corners (np.array): The four transformed corner points of the template in the scene.
+        good_matches (list): The list of good matches.
+        If detection fails, returns (None, None, good_matches).
     """
-    # Convert the scene image to grayscale.
+    # Convert the scene image to grayscale and preprocess it.
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = preprocess_image(gray)
     
-    # Detect keypoints and descriptors in the scene.
-    kp_scene, des_scene = orb.detectAndCompute(gray, None)
+    # Detect keypoints and compute descriptors in the scene.
+    kp_scene, des_scene = sift.detectAndCompute(gray, None)
     if des_scene is None:
+        print("No descriptors found in scene.")
         return None, None, None
-
-    # Perform KNN matching (k=2) and apply Lowe's ratio test.
+    
+    print("Scene keypoints:", len(kp_scene))
+    
+    # Perform KNN matching (k=2) and apply the ratio test.
     knn_matches = bf.knnMatch(des_template, des_scene, k=2)
     good_matches = []
     for m, n in knn_matches:
         if m.distance < ratio_thresh * n.distance:
             good_matches.append(m)
     
+    print("Good matches:", len(good_matches))
+    
     if len(good_matches) < min_matches:
+        print("Not enough good matches.")
         return None, None, good_matches
-
-    # Extract coordinates of matching keypoints.
+    
+    # Extract the coordinates of matching keypoints.
     pts_template = np.float32([kp_template[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
     pts_scene = np.float32([kp_scene[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
     
     # Compute homography using RANSAC.
     H, mask = cv2.findHomography(pts_template, pts_scene, cv2.RANSAC, 5.0)
     if H is None:
+        print("Homography computation failed.")
         return None, None, good_matches
     
     # Define the template's corner points.
@@ -102,7 +121,6 @@ def find_template_orb(image, min_matches=10, ratio_thresh=0.75):
                                    [template_w, 0],
                                    [template_w, template_h],
                                    [0, template_h]]).reshape(-1, 1, 2)
-    
     # Transform the template corners to the scene.
     scene_corners = cv2.perspectiveTransform(template_corners, H)
     
@@ -117,15 +135,15 @@ def find_template_orb(image, min_matches=10, ratio_thresh=0.75):
 @app.route('/find_rover', methods=['GET'])
 def find_rover_endpoint():
     """
-    Capture an image (or use the existing capture.jpg), detect the template using ORB,
-    and return its centroid coordinates as JSON.
+    Capture an image (or use the existing capture.jpg), use SIFT feature matching to detect the template,
+    and return its centroid and number of good matches as JSON.
     """
     try:
         image = capture_image()
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     
-    center, corners, good_matches = find_template_orb(image)
+    center, corners, good_matches = find_template_sift(image)
     if center is None:
         return jsonify({"error": "Template not found"}), 404
     else:
@@ -134,26 +152,27 @@ def find_rover_endpoint():
 @app.route('/render', methods=['GET'])
 def render_endpoint():
     """
-    Capture an image (or use the existing capture.jpg), detect the template using ORB,
-    draw the ORB keypoints and good matches, annotate the image with the detected template region,
-    and save/return the annotated image.
+    Capture an image (or use the existing capture.jpg), use SIFT feature matching to detect the template,
+    draw the SIFT keypoints on the scene, overlay the detected template region and centroid,
+    and return the annotated image as a JPEG.
     """
     try:
         image = capture_image()
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    # Convert image to grayscale and compute ORB keypoints/descriptors for the scene.
+    # Convert the image to grayscale and preprocess.
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    kp_scene, des_scene = orb.detectAndCompute(gray, None)
+    gray = preprocess_image(gray)
     
-    # Draw all keypoints on a copy of the image.
+    # Detect SIFT keypoints/descriptors in the scene.
+    kp_scene, des_scene = sift.detectAndCompute(gray, None)
     keypoints_img = cv2.drawKeypoints(image, kp_scene, None, color=(0, 0, 255), flags=0)
     
     # Run template matching.
-    center, corners, good_matches = find_template_orb(image)
+    center, corners, good_matches = find_template_sift(image)
     
-    # Annotate with keypoints count.
+    # Annotate with the total keypoints count.
     cv2.putText(keypoints_img, f"Keypoints: {len(kp_scene)}", (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
     
@@ -166,14 +185,14 @@ def render_endpoint():
         # Annotate with text.
         cv2.putText(keypoints_img, f"Template ({center[0]}, {center[1]})", (center[0]-40, center[1]-10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-        # Annotate with the number of good matches.
+        # Annotate with number of good matches.
         cv2.putText(keypoints_img, f"Good Matches: {len(good_matches)}", (10, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
     else:
         cv2.putText(keypoints_img, "Template not found", (10, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
     
-    # Save the annotated image to disk (optional).
+    # Optionally, save the annotated image.
     cv2.imwrite("annotated_capture.jpg", keypoints_img)
     
     ret, jpeg = cv2.imencode('.jpg', keypoints_img)
