@@ -5,165 +5,109 @@ import time
 
 app = Flask(__name__)
 
-# --- YOLO MODEL SETUP ---
-YOLO_CONFIG = "yolov3.cfg"
-YOLO_WEIGHTS = "yolov3.weights"
-YOLO_NAMES = "coco.names"
-
-# Load class names from the coco.names file.
-with open(YOLO_NAMES, "r") as f:
-    classes = [line.strip() for line in f.readlines()]
-
-# Set your target class. Change this to a class present in coco.names.
-TARGET_CLASS = "truck"
-
-# Load YOLO model.
-net = cv2.dnn.readNetFromDarknet(YOLO_CONFIG, YOLO_WEIGHTS)
-net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-
-# Get the output layer names.
-layer_names = net.getLayerNames()
-# Some versions of OpenCV return a tuple for getUnconnectedOutLayers().
-unconnected_layers = net.getUnconnectedOutLayers()
-if isinstance(unconnected_layers, tuple):
-    output_layers = [layer_names[i - 1] for i in unconnected_layers]
-else:
-    output_layers = [layer_names[i - 1] for i in unconnected_layers.flatten()]
-
-# --- IMAGE CAPTURE FUNCTION ---
 def capture_image():
     """
-    Captures a single image from an alternative camera (device index 1)
+    Captures a single image from the webcam (device index 1)
     and returns it as a BGR NumPy array.
     """
-    cap = cv2.VideoCapture(1)  # Change index if needed.
+    cap = cv2.VideoCapture(1)  # Adjust index if needed.
     if not cap.isOpened():
         raise RuntimeError("Could not open camera on device index 1")
-    
     time.sleep(0.5)  # Allow the camera to warm up.
     ret, frame = cap.read()
     cap.release()
-    
     if not ret:
         raise RuntimeError("Failed to capture image from the camera")
-    
     return frame
 
-# --- YOLO DETECTION FUNCTION ---
-def detect_target_yolo(image, conf_threshold=0.5, nms_threshold=0.4):
+def detect_light_gray_cluster(image, min_area=50, max_area=500):
     """
-    Uses YOLO to detect objects in the image and returns the bounding box and centroid
-    of the detection matching TARGET_CLASS with the highest confidence.
-    
-    Args:
-        image: BGR image from the camera.
-        conf_threshold: Confidence threshold for detections.
-        nms_threshold: Non-maxima suppression threshold.
+    Detects a small cluster of light gray pixels in the image using basic thresholding.
+
+    Process:
+      1. Convert the image to HSV.
+      2. Threshold for light gray (low saturation and high brightness).
+      3. Optionally apply morphological operations to reduce noise.
+      4. Find contours in the binary mask.
+      5. For each contour, if its area is between min_area and max_area, compute its centroid.
     
     Returns:
-        center (tuple): (center_x, center_y) of the detected object.
-        box (tuple): (x, y, w, h) bounding box of the detected object.
-        If no target is found, returns (None, None).
+      (cx, cy, contour): The centroid (cx, cy) of the detected cluster and the contour.
+      If no valid cluster is found, returns (None, None, None).
     """
-    height, width = image.shape[:2]
-    # Create a blob from the image.
-    blob = cv2.dnn.blobFromImage(image, scalefactor=1/255.0, size=(416, 416),
-                                 swapRB=True, crop=False)
-    net.setInput(blob)
-    outputs = net.forward(output_layers)
+    # Convert image to HSV color space.
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     
-    boxes = []
-    confidences = []
-    class_ids = []
+    # Define HSV thresholds for light gray.
+    # Light gray typically has very low saturation and high brightness.
+    lower_gray = np.array([0, 0, 200])    # You may adjust these values as needed.
+    upper_gray = np.array([179, 50, 255])
+    mask = cv2.inRange(hsv, lower_gray, upper_gray)
     
-    # Loop over each output layer.
-    for output in outputs:
-        for detection in output:
-            scores = detection[5:]
-            class_id = np.argmax(scores)
-            confidence = scores[class_id]
-            if confidence > conf_threshold:
-                center_x = int(detection[0] * width)
-                center_y = int(detection[1] * height)
-                w = int(detection[2] * width)
-                h = int(detection[3] * height)
-                x = int(center_x - w / 2)
-                y = int(center_y - h / 2)
-                
-                boxes.append([x, y, w, h])
-                confidences.append(float(confidence))
-                class_ids.append(class_id)
+    # Optionally reduce noise with morphological operations.
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
     
-    # Apply non-maxima suppression.
-    indices = cv2.dnn.NMSBoxes(boxes, confidences, conf_threshold, nms_threshold)
-    if len(indices) > 0:
-        indices = np.array(indices).flatten()
-    else:
-        indices = []
+    # Find contours in the mask.
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    best_box = None
-    best_conf = -1
-    # Look for detections matching our target class.
-    for i in indices:
-        if classes[class_ids[i]] == TARGET_CLASS:
-            if confidences[i] > best_conf:
-                best_conf = confidences[i]
-                best_box = boxes[i]
-    
-    if best_box is not None:
-        x, y, w, h = best_box
-        center = (x + w // 2, y + h // 2)
-        return center, best_box
-    else:
-        return None, None
+    # Look for a contour with area within our desired range.
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if min_area <= area <= max_area:
+            # Compute centroid of the contour.
+            M = cv2.moments(cnt)
+            if M['m00'] != 0:
+                cx = int(M['m10'] / M['m00'])
+                cy = int(M['m01'] / M['m00'])
+                return cx, cy, cnt
+    return None, None, None
 
-# --- FLASK ENDPOINTS ---
 @app.route('/find_rover', methods=['GET'])
 def find_rover_endpoint():
     """
-    Capture an image from the camera, use YOLO to detect the target object,
-    and return its center coordinates as JSON.
+    Capture an image, detect a small light gray cluster, and return its centroid as JSON.
     """
     try:
         image = capture_image()
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
-    
-    center, box = detect_target_yolo(image)
-    if center is None:
-        return jsonify({'error': 'Target object not found'}), 404
+        return jsonify({"error": str(e)}), 500
+
+    cx, cy, _ = detect_light_gray_cluster(image)
+    if cx is None:
+        return jsonify({"error": "Light gray cluster not found"}), 404
     else:
-        return jsonify({'x': center[0], 'y': center[1]})
+        return jsonify({"x": cx, "y": cy})
 
 @app.route('/render', methods=['GET'])
 def render_endpoint():
     """
-    Capture an image from the camera, use YOLO to detect the target object,
-    annotate the image with a bounding box and the center coordinate,
-    and return the annotated image as a JPEG.
+    Capture an image, detect a small light gray cluster, annotate the image with the
+    detected contour and centroid, and return the annotated image as a JPEG.
     """
     try:
         image = capture_image()
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
-    
-    center, box = detect_target_yolo(image)
-    
-    if center is not None and box is not None:
-        x, y, w, h = box
-        cv2.rectangle(image, (x, y), (x+w, y+h), (0, 255, 0), 2)
-        cv2.circle(image, center, 5, (0, 255, 0), -1)
-        cv2.putText(image, f'{TARGET_CLASS} ({center[0]}, {center[1]})', 
-                    (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        return jsonify({"error": str(e)}), 500
+
+    cx, cy, contour = detect_light_gray_cluster(image)
+    if cx is not None and contour is not None:
+        # Draw the detected contour.
+        cv2.drawContours(image, [contour], -1, (0, 255, 0), 2)
+        # Draw a circle at the centroid.
+        cv2.circle(image, (cx, cy), 5, (0, 255, 0), -1)
+        # Annotate with text.
+        cv2.putText(image, f"Cluster ({cx}, {cy})", (cx - 40, cy - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
     else:
-        cv2.putText(image, 'Target object not found', (10, 30),
+        cv2.putText(image, "Light gray cluster not found", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
     
-    ret, jpeg = cv2.imencode('.jpg', image)
+    ret, jpeg = cv2.imencode(".jpg", image)
     if not ret:
-        return jsonify({'error': 'Could not encode image'}), 500
-    return Response(jpeg.tobytes(), mimetype='image/jpeg')
+        return jsonify({"error": "Could not encode image"}), 500
+    return Response(jpeg.tobytes(), mimetype="image/jpeg")
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
