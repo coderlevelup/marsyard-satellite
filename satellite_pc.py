@@ -120,6 +120,9 @@ def render_endpoint():
     else:
         cv2.putText(image, "Target object not found", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+    # Optionally, save the annotated image.
+    cv2.imwrite("annotated_capture.jpg", image)
     
     ret, jpeg = cv2.imencode(".jpg", image)
     if not ret:
